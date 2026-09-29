@@ -54,9 +54,9 @@ def find_git() -> str:
     return "git"
 
 
-def runtime_files() -> list[str]:
+def runtime_files(git: str) -> list[str]:
     """仓库里真正要在云端跑的文件（受版本控制，排除构建工具）。"""
-    p = subprocess.run([find_git(), "ls-files"], cwd=HERE, capture_output=True, text=True)
+    p = subprocess.run([git, "ls-files"], cwd=HERE, capture_output=True, text=True)
     files = []
     for line in p.stdout.splitlines():
         f = line.strip()
@@ -70,7 +70,27 @@ def runtime_files() -> list[str]:
     return sorted(files)
 
 
-def build_bundle(files: list[str]) -> str:
+def blob_bytes(git: str, path: str) -> bytes:
+    """取 HEAD 里这个文件的规范内容，**而不是工作区的原始字节**。
+
+    为什么不直接 open() 读文件：工作区可能含有仓库里并不存在的差异。
+    本仓库真的踩过 —— `scripts/cloud_runner.py` 工作区是 CRLF、`.gitattributes`
+    写的是 `* text=auto eol=lf`，两边不一致而且 `git status` 还看着是干净的
+    （git 只在规范化之后比较，所以显示不出来）。那时打出来的分享包，
+    发出去的字节和仓库里的并不相同。
+
+    读 HEAD 的 blob 就没有这个问题：分享包永远等于某一次提交的内容。
+    """
+    p = subprocess.run([git, "cat-file", "blob", f"HEAD:{path}"], cwd=HERE,
+                       capture_output=True)
+    if p.returncode != 0:
+        raise SystemExit(
+            "读不到 HEAD:{} —— 文件可能还没提交。\n{}".format(
+                path, p.stderr.decode("utf-8", "replace").strip()))
+    return p.stdout
+
+
+def build_bundle(git: str, files: list[str]) -> str:
     """打成 tar.gz 再 base64。
 
     固定 mtime / uid / gid / uname，保证同样内容每次产出的字节一致，
@@ -79,7 +99,7 @@ def build_bundle(files: list[str]) -> str:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tf:
         for path in files:
-            data = open(os.path.join(HERE, path), "rb").read()
+            data = blob_bytes(git, path)
             info = tarfile.TarInfo(name=path)
             info.size = len(data)
             info.mtime = 0
@@ -186,12 +206,14 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", default=os.path.join(HERE, "dist"), help="输出目录")
     args = ap.parse_args(argv[1:])
 
-    files = runtime_files()
-    print("打包 {} 个文件：".format(len(files)))
+    git = find_git()
+
+    files = runtime_files(git)
+    print("打包 {} 个文件（内容取自 HEAD，不是工作区原始字节）：".format(len(files)))
     for f in files:
         print("   -", f)
 
-    bundle = build_bundle(files)
+    bundle = build_bundle(git, files)
     print("\nbundle base64 长度：{}".format(len(bundle)))
 
     tmpl = open(TEMPLATE, encoding="utf-8").read()
