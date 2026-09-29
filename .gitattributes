@@ -1,0 +1,4 @@
+# 仓库在 Linux runner 上执行，统一用 LF，避免 Windows 本地编辑时把 CRLF 带进去
+* text=auto eol=lf
+*.png binary
+*.jpg binary

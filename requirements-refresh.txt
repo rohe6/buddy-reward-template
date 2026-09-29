@@ -1,0 +1,4 @@
+# 只有「本机刷新脚本」需要，云端 runner 用标准库、零依赖
+playwright>=1.40
+# 可选：没有 gh CLI 时，用它走 GitHub REST 通道写入 Secret
+pynacl>=1.5

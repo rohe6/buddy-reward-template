@@ -1,0 +1,119 @@
+name: Buddy daily reward
+
+# 每天定时跑一次：一次把「签到」和「派猫猫」都做掉，结果推飞书。
+#
+# 关于 cron，三条官方规则决定了这里怎么写：
+#   1. schedule 只在仓库的**默认分支**上生效，且工作流文件必须已存在于默认分支
+#   2. 默认按 UTC 计算，且不识别夏令时（中国无夏令时，所以常年恒定）
+#      00:07 UTC = 北京时间 08:07
+#   3. 整点是 GitHub 负载高峰，任务可能被延迟 15 分钟以上甚至丢弃，
+#      官方建议避开 :00 —— 所以这里用 :07 而不是 :00
+on:
+  schedule:
+    - cron: "7 0 * * *"
+  # 手动触发，方便第一次验证和偶尔补跑（脚本幂等，重复跑无副作用）
+  workflow_dispatch:
+
+# 同一时间只跑一个，避免两次运行撞车重复派遣
+concurrency:
+  group: buddy-daily-reward
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # 解释器路径不写死版本号：用 command -v 动态取，并交给后续步骤使用
+      - name: Resolve interpreter
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python3 || command -v python)"
+          if [ -z "${PYTHON_BIN}" ]; then
+            echo "找不到 python 解释器" >&2
+            exit 1
+          fi
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+          "${PYTHON_BIN}" --version
+
+      # 预检：确认 Secret 真的送到了，而且长度合理。
+      #
+      # 为什么需要这一步：Secret 是只写的，网页上粘贴 6700+ 字符极容易
+      # 被悄悄截断，而且粘错了当场看不出来。截断后的值仍是非空的，
+      # 接口只会回一个 401，看上去和「会话过期」一模一样，会把人带偏。
+      #
+      # 这里只打印长度和 sha256 指纹（与刷新脚本输出的「指纹」同算法），
+      # 泄露不了内容，但能一眼判断 Secret 是否完整。
+      - name: Preflight - check WB_COOKIE shape
+        env:
+          WB_COOKIE: ${{ secrets.WB_COOKIE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WB_COOKIE}" ]; then
+            echo "::error::Secret WB_COOKIE 是空的（没配置，或名字拼错）"
+            exit 1
+          fi
+          LEN=${#WB_COOKIE}
+          FP=$(printf '%s' "$WB_COOKIE" | sha256sum | cut -c1-8)
+          echo "WB_COOKIE: 长度=${LEN} 指纹=${FP}"
+          if [ "$LEN" -lt 1000 ]; then
+            echo "::error::WB_COOKIE 只有 ${LEN} 个字符，明显被截断了。"
+            echo "::error::完整的会话 Cookie 有数千字符，请在本机重跑一次刷新/部署脚本重新注入。"
+            exit 1
+          fi
+          case "$WB_COOKIE" in
+            *KEYCLOAK_SESSION*) ;;
+            *)
+              echo "::error::WB_COOKIE 里看不到 KEYCLOAK_SESSION，内容可能被篡改或粘贴错位。"
+              exit 1
+              ;;
+          esac
+
+      # 凭证只从 Secret 注入到环境变量，不落盘、不进命令行、不进日志
+      - name: Run checkin + buddy travel
+        env:
+          WB_COOKIE: ${{ secrets.WB_COOKIE }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # 签到成功 → 退出码 0；签到失败 → 退出码 1，但旅行结果仍会写进 result.json
+          set +e
+          "$PYTHON_BIN" scripts/cloud_runner.py \
+            --out out/result.json \
+            --raw-out out/raw_masked.json
+          echo "RUNNER_EXIT=$?" >> "$GITHUB_ENV"
+          set -e
+
+      - name: Push to Feishu
+        if: always()
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -f out/result.json ]; then
+            "$PYTHON_BIN" scripts/feishu_notify.py out/result.json || true
+          else
+            echo "没有产出 result.json，跳过推送"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buddy-reward-result
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 签到失败时让这次运行标红，方便一眼看到；旅行失败不影响
+      - name: Enforce checkin result
+        if: env.RUNNER_EXIT != '0'
+        run: |
+          echo "签到未成功（exit=${RUNNER_EXIT}），请查看上方日志与飞书通知" >&2
+          exit 1

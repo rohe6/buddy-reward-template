@@ -1,0 +1,14 @@
+# 本机凭据 —— 永远不要提交
+*.local.json
+*.local.jar
+credentials.env
+credentials.json
+cookie.txt
+
+# 运行产物
+out/
+__pycache__/
+*.pyc
+
+# 构建产物（分享包，由 build_share_kit.py 生成）
+dist/
