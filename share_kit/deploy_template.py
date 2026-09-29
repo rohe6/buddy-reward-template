@@ -418,8 +418,149 @@ def wait_ws_url(port: int, timeout: float = 30.0) -> str:
     raise TimeoutError("拿不到浏览器调试地址")
 
 
-def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 300):
-    """返回 (cookie_header, validate_fn)。validate_fn 用来判断这组 Cookie 是否真的生效。"""
+class CookieUnavailable(RuntimeError):
+    """自动抓取拿不到可用会话。调用方据此退回「手工粘贴」那条路。"""
+
+
+# 本机可能已经登录着 WorkBuddy 网页版的浏览器 profile。
+# WorkBuddy 自己的「Buddy 旅行」技能就维护着其中一个，仓库里的
+# scripts/refresh_credentials.py 也是从那里读会话的 —— 复用同一份登录态，语义一致。
+KNOWN_PROFILES = (
+    os.path.join(os.path.expanduser("~"), ".workbuddy", "buddy-travel-data", "browser_profile"),
+)
+# 登录态只需要这三个文件：Cookie 的值由 Local State 里的密钥加密，
+# 同一个 Windows 用户可以解，所以复制过去浏览器就能直接读出来。
+PROFILE_AUTH_FILES = ("Local State",
+                      os.path.join("Default", "Network", "Cookies"),
+                      os.path.join("Default", "Preferences"))
+
+
+def _cookie_db_names(path: str) -> set:
+    """只读 Cookie 库里的名字，不解密值 —— 用来判断这份 profile 值不值得折腾。"""
+    import sqlite3
+    con = sqlite3.connect("file:" + path.replace(os.sep, "/") + "?immutable=1", uri=True)
+    try:
+        return {r[0] for r in con.execute(
+            "select name from cookies where host_key like '%workbuddy%'")}
+    finally:
+        con.close()
+
+
+def session_from_local_profile() -> str | None:
+    """试着复用本机已经登录好的浏览器会话，成功返回 Cookie 头，失败返回 None。
+
+    为什么值得有这条快路径：默认那条路要在一个全新窗口里手动登录一次。
+    但若这台机器上 WorkBuddy 自己就维护着已登录的 profile，这一步可以完全省掉
+    （实测 10 秒内拿到可用会话，零交互）。
+
+    做法：只把登录态需要的三个文件复制到临时目录，用浏览器打开那个副本读 Cookie。
+    不碰原 profile（那是别的工具在用的），也不影响用户正开着的浏览器窗口。
+    任何一步不顺就安静放弃，交给后面那条「弹窗登录」的路 —— 快路径绝不能把主流程带崩。
+    """
+    exe = find_browser()
+    if not exe:
+        return None
+
+    for src in KNOWN_PROFILES:
+        db = os.path.join(src, "Default", "Network", "Cookies")
+        if not os.path.isfile(db):
+            continue
+        try:
+            if "KEYCLOAK_SESSION" not in _cookie_db_names(db):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+
+        print("  发现本机已有的 WorkBuddy 登录态，先试着直接复用…")
+        tmp = tempfile.mkdtemp(prefix="buddy-reuse-")
+        proc = None
+        try:
+            for rel in PROFILE_AUTH_FILES:
+                s = os.path.join(src, rel)
+                if os.path.isfile(s):
+                    d = os.path.join(tmp, rel)
+                    os.makedirs(os.path.dirname(d), exist_ok=True)
+                    shutil.copy2(s, d)
+
+            # 剥掉代理：从 WorkBuddy 里拉起的 shell 可能带着一个随时失效的本地代理，
+            # 浏览器继承后连不上网（读 Cookie 不受影响，但没必要给它添乱）。
+            env = {k: v for k, v in os.environ.items()
+                   if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+            # ⚠️ 不要加 --headless=new：实测 headless 下读不到 session_2
+            # （10 条 cookie、头长 2182、校验 401），可见窗口下正常
+            # （9 条、头长 6773、校验通过）。session_2 正是过网关卡的那一个。
+            # 窗口挪到屏幕外，免得闪一下打扰用户。
+            proc = subprocess.Popen([
+                exe, "--remote-debugging-port=0", "--user-data-dir=" + tmp,
+                "--no-first-run", "--no-default-browser-check",
+                "--window-position=-32000,-32000", "--window-size=800,600",
+                WORKBUDDY_URL,
+            ], env=env)
+
+            port = None
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                p = _read_active_port(tmp)
+                if p and _port_alive(p):
+                    port = p
+                    break
+                time.sleep(0.3)
+            if not port:
+                return None
+
+            cdp = CDP(WS(wait_ws_url(port), timeout=40.0))
+
+            # 轮询而不是睡固定时长：Cookie 什么时候从库里读出来没有保证，
+            # 拿到一份就校验一份，通过了立刻走人。
+            last_tried = None
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                try:
+                    cookies = cdp.call("Storage.getCookies").get("cookies", []) or []
+                except Exception:  # noqa: BLE001
+                    time.sleep(1.0)
+                    continue
+                ours = [c for c in cookies if "workbuddy.cn" in (c.get("domain") or "")]
+                if not ours:
+                    time.sleep(1.0)
+                    continue
+                header = "; ".join("{}={}".format(c["name"], c["value"]) for c in ours)
+                if header != last_tried:
+                    last_tried = header
+                    good, _ = validate_cookie(header)
+                    if good:
+                        print("  复用成功，不用再登录了。")
+                        return header
+                time.sleep(1.5)
+            print("  那份登录态已经失效，继续走登录流程。")
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+            shutil.rmtree(tmp, ignore_errors=True)
+    return None
+
+
+def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 420) -> str:
+    """拉起专用浏览器窗口，等一个**真的能用**的会话，返回 Cookie 头。
+
+    ⚠️ 判据绝不能用「某个 Cookie 名字出现了」。
+    实测（全新 profile、完全没有登录）打开页面两三秒内就会带上 29 条 Cookie，
+    里面赫然包括 KEYCLOAK_SESSION / KEYCLOAK_IDENTITY / AUTH_SESSION_ID /
+    session / session_2 —— 那只是一份**匿名会话**，调接口只会回 401。
+
+    按名字判断的后果很严重：脚本会在两三秒内"抓取成功" → 校验失败 →
+    顺手把浏览器窗口关掉 → 用户根本没机会登录，只看到窗口一闪而过。
+    所以这里**只有 validate_cookie 通过才算数**。
+
+    另外：成功后**不关闭**这个窗口。一是 profile 会保留登录态，下次跑直接复用；
+    二是超时后用户还能在窗口里慢慢登录再重跑。
+    """
     exe = find_browser()
     if not exe:
         die("本机没找到 Edge 或 Chrome。请先装一个浏览器再重跑本脚本。")
@@ -432,6 +573,8 @@ def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 300):
         ok("复用上次留下的浏览器窗口")
     else:
         if port:
+            # 上一次留下的端口文件可能指向一个已经退出的浏览器，
+            # 不清掉的话本次会连到死端口。
             try:
                 os.remove(os.path.join(PROFILE_DIR, "DevToolsActivePort"))
             except OSError:
@@ -454,8 +597,6 @@ def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 300):
                 break
             time.sleep(0.3)
         if not port:
-            if proc:
-                proc.terminate()
             die("浏览器起来了但调试端口没通。\n"
                 "     常见原因：这个工具之前开的浏览器窗口还开着。\n"
                 "     请把那个窗口全部关掉，然后重新运行本脚本。")
@@ -465,14 +606,17 @@ def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 300):
 
     print()
     hr("*")
-    print("  👉 请在弹出的浏览器窗口里登录 WorkBuddy")
-    print("     （如果已经登录过，脚本会自动检测，直接往下走）")
-    print("     登录完成后不用做别的，脚本会自己继续。")
+    print("  👉 请在刚弹出的浏览器窗口里登录 WorkBuddy")
+    print("     登录完成后什么都不用做，脚本会自动继续。")
+    print("     （这个窗口里可能已经显示着一个「未登录」的页面，")
+    print("       那是匿名会话，直接登录即可，不用管它。）")
     hr("*")
     print()
     print("  正在等待登录…", end="", flush=True)
 
     deadline = time.time() + wait_seconds
+    last_tried = None
+    rejected_note = False
     dots = 0
     try:
         while time.time() < deadline:
@@ -481,14 +625,32 @@ def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 300):
             except Exception:  # noqa: BLE001
                 time.sleep(1.0)
                 continue
+
             ours = [c for c in cookies if "workbuddy.cn" in (c.get("domain") or "")]
             names = {c["name"] for c in ours}
+            header = None
             if required in names:
                 header = "; ".join("{}={}".format(c["name"], c["value"]) for c in ours)
-                print()
-                return header
+
+            # 只在 Cookie 组合**发生变化**时才去调接口，别每 1.5 秒打一次
+            if header and header != last_tried:
+                last_tried = header
+                good, detail = validate_cookie(header)
+                if good:
+                    print(" 有效")
+                    print("  （这个浏览器窗口先留着：profile 会记住登录，"
+                          "下次运行可以直接复用。）")
+                    return header
+                if not rejected_note:
+                    rejected_note = True
+                    print()
+                    warn("这个窗口当前是一份**匿名会话**（未登录也会有 KEYCLOAK_SESSION，"
+                         "所以不能只看 Cookie 名字）。")
+                    warn("接口返回：{}".format(detail[:80]))
+                    print("     → 请在窗口里完成登录，脚本会继续等。", flush=True)
+
             dots += 1
-            if dots % 6 == 0:
+            if dots % 8 == 0:
                 print(".", end="", flush=True)
             time.sleep(1.5)
     finally:
@@ -496,17 +658,12 @@ def capture_cookie(required: str = "KEYCLOAK_SESSION", wait_seconds: int = 300):
             ws.close()
         except Exception:  # noqa: BLE001
             pass
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
+        # 注意：这里刻意**不** terminate 浏览器，理由见函数开头。
 
-    print()
-    die("等登录超时（{} 秒）。请检查：\n"
-        "     1) 那个浏览器窗口有没有成功打开\n"
-        "     2) 有没有在 www.workbuddy.cn 上登录成功\n"
-        "     3) 关闭所有该工具开的浏览器窗口后重跑".format(wait_seconds))
+    raise CookieUnavailable(
+        "等了 {} 秒还没等到一个可用的会话。\n"
+        "     那个浏览器窗口还开着，你可以登录好之后重新运行本脚本（会直接复用）。\n"
+        "     也可以按下面的办法手工复制一次 Cookie。".format(wait_seconds))
 
 
 def validate_cookie(header: str) -> tuple[bool, str]:
@@ -918,15 +1075,22 @@ def main() -> int:
         ok("仓库已存在，直接用：{}".format(full_repo))
 
     step(4, TOTAL, "读取 WorkBuddy 登录状态")
-    cookie = capture_cookie()
-
-    for attempt in range(3):
-        good, detail = validate_cookie(cookie)
-        if good:
+    # 两条路，优先零交互的那条：
+    #   1) 复用本机 WorkBuddy 自己维护的已登录 profile（有的话，10 秒搞定）
+    #   2) 弹一个专用窗口让用户登录（capture_cookie 内部已校验，拿不到有效会话
+    #      就抛 CookieUnavailable，再退回手工粘贴）
+    # 这里刻意不做「按 Cookie 名字判断 + 重试三次」——旧写法会在两三秒内
+    # 抓到一份匿名会话（未登录也有 KEYCLOAK_SESSION），然后把关掉的窗口
+    # 当成"用户没登录"，纯属自己制造故障。
+    cookie = session_from_local_profile()
+    if cookie:
+        ok("凭证有效（长度 {}，指纹 {}）".format(len(cookie), secret_fingerprint(cookie)))
+    else:
+        try:
+            cookie = capture_cookie()
             ok("凭证有效（长度 {}，指纹 {}）".format(len(cookie), secret_fingerprint(cookie)))
-            break
-        warn("这组 Cookie 调接口没通过：{}".format(detail[:120]))
-        if attempt == 2:
+        except CookieUnavailable as e:
+            warn(str(e))
             print(COOKIE_PASTE_HINT)
             cookie = ask_secret("复制好 Cookie 之后", allow_clipboard=True)
             if not cookie:
@@ -936,9 +1100,6 @@ def main() -> int:
                 die("这组 Cookie 依然不通过：{}\n"
                     "     确认一下是不是在 www.workbuddy.cn 登录成功后再复制的。".format(detail[:200]))
             ok("凭证有效（长度 {}，指纹 {}）".format(len(cookie), secret_fingerprint(cookie)))
-            break
-        print("  → 请在那个浏览器窗口里完成登录，脚本会继续重试…")
-        cookie = capture_cookie()
 
     step(5, TOTAL, "写入仓库 Secret 与代码")
     existing = list_secret_names(gh, full_repo)
