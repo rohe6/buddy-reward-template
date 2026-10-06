@@ -2,16 +2,23 @@ name: Buddy daily reward
 
 # 每天定时跑一次：一次把「签到」和「派猫猫」都做掉，结果推飞书。
 #
-# 关于 cron，三条官方规则决定了这里怎么写：
+# 关于 cron，几条规则决定了这里怎么写：
 #   1. schedule 只在仓库的**默认分支**上生效，且工作流文件必须已存在于默认分支
-#   2. 默认按 UTC 计算，且不识别夏令时（中国无夏令时，所以常年恒定）
-#      00:07 UTC = 北京时间 08:07
-#   3. 整点是 GitHub 负载高峰，任务可能被延迟 15 分钟以上甚至丢弃，
-#      官方建议避开 :00 —— 所以这里用 :07 而不是 :00
+#   2. 默认按 UTC 计算，不识别夏令时。中国全年 UTC+8，所以恒定不变：
+#        23:50 UTC = 次日北京时间 07:50
+#      注意 UTC 的日期比北京早一天，翻日志时别以为跑错了天。
+#   3. **不要指望这条 cron 准点。** GitHub 的 cron 调度器从 2026-08 起大面积积压：
+#      官方社区讨论 #206019 / #208924 里大量仓库报告每天晚 3~10 小时，而且
+#      created_at == run_started_at —— 是调度事件本身晚创建，不是排队等 runner。
+#      本仓库实测：9/29 那次还准（晚 44 秒），9/30 起每天稳定落在 05:08~05:41 UTC，
+#      也就是恒定晚 5 小时左右。换分钟数、改时区都治不了，属于平台侧问题。
+#      所以这条 cron 只能保证「每天跑一次」，具体时刻是尽力而为。
+#      要准点触发，走 workflow_dispatch + 外部定时器（做法见 README）。
 on:
   schedule:
-    - cron: "7 0 * * *"
-  # 手动触发，方便第一次验证和偶尔补跑（脚本幂等，重复跑无副作用）
+    - cron: "50 23 * * *"
+  # 手动触发：首次验证、偶尔补跑，也是外部定时器准点触发的入口。
+  # 脚本幂等，重复跑无副作用。
   workflow_dispatch:
 
 # 同一时间只跑一个，避免两次运行撞车重复派遣
@@ -28,6 +35,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      # 记录「被哪条 cron 触发」和「实际几点开始」。
+      # GitHub 的 cron 调度器可能把运行推迟好几个小时才创建（见文件头第 3 条），
+      # 有这两行就能一眼算出晚了多久，不用再去猜。
+      - name: Log trigger and start time
+        run: |
+          set -euo pipefail
+          echo "schedule   : ${{ github.event.schedule }}"
+          echo "event      : ${{ github.event_name }}"
+          echo "started UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "started CST: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
 
       # 解释器路径不写死版本号：用 command -v 动态取，并交给后续步骤使用
       - name: Resolve interpreter

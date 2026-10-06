@@ -1,6 +1,7 @@
 # Buddy 每日任务 · GitHub Actions 自动化
 
-每天定时（北京时间 **08:07**，见下方「为什么不是整点」）在 GitHub 的免费 runner 上跑一次：
+每天定时（目标北京时间 **07:50**，另有说明见下方「为什么实际快到下午一点才收到」）
+在 GitHub 的免费 runner 上跑一次：
 **先签到 → 再先领已到家的旅行奖励 → 再判断要不要派新的一趟**，结果推送到飞书。
 
 不需要常开电脑。云端 runner 上没有任何本机登录态，凭证由本机刷新脚本导出后放进仓库 Secret。
@@ -283,17 +284,68 @@ WB_COOKIE_FILE=~/.workbuddy/buddy-reward-gha/credentials.env \
 （`{"code":10001,"msg":"今天已签到，请明天再来"}`）。因为 HTTP 状态码骗人，
 云端脚本的判断依据是 body 里的业务码，HTTP 码只用来识别 401。
 
-**Q：为什么是 08:07 而不是整点 08:00？**
-GitHub 官方明确提示整点是负载高峰，schedule 任务可能被延迟 15 分钟以上，负载极高时甚至被丢弃，
-并建议把时间挪开整点。所以 cron 写成 `7 0 * * *`（UTC）= 北京 08:07。
-另外 GitHub 也支持给 schedule 加 IANA 时区：
+**Q：为什么 cron 写的是 `50 23 * * *`，而不是直接写北京时间的 07:50？**
+GitHub 的 schedule 默认按 **UTC** 计算，北京时间是 UTC+8，所以
+07:50 北京 = **23:50 UTC（前一天）**。注意 UTC 的日期比北京早一天，翻日志时别搞混。
+GitHub 现在也支持给 schedule 加 IANA 时区，写成下面这样两者等价：
 
 ```yaml
 on:
   schedule:
-    - cron: "7 8 * * *"
+    - cron: "50 7 * * *"
       timezone: "Asia/Shanghai"
 ```
+
+**Q：说好早上 07:50，为什么实际快到下午一点才收到飞书卡片？**
+因为**不准时的是 GitHub 的 cron 调度器本身**，跟我们怎么写没关系。
+
+官方文档只承诺「尽力而为」：`The schedule event can be delayed during periods of
+high loads of GitHub Actions workflow runs … some queued jobs may be dropped`。
+而从 **2026-08 下旬**起出现了大面积的平台侧积压，官方社区讨论
+[#206019](https://github.com/orgs/community/discussions/206019) 和
+[#208924](https://github.com/orgs/community/discussions/208924)
+里大量仓库报告**每天晚 3~10 小时**，并且这些运行的
+`created_at == run_started_at`（秒级相同）—— 说明是**调度事件本身晚创建**，
+不是排队等 runner，所以换分钟数、加时区、换分支都治不了。
+
+本仓库实测：9/29 那次还准（只晚 44 秒），**9/30 起每天稳定落在 05:08~05:41 UTC，
+也就是恒定晚 5 小时左右**。
+
+结论：
+
+- 这条 cron 只能保证「**每天跑一次**」，具体时刻不可控。**签到不会漏**
+  （脚本幂等，晚点跑照样把当天的奖励领掉），只是飞书卡片来得晚。
+- 想**准点**，得绕开 cron 调度器，用外部定时器去调 `workflow_dispatch`
+  —— 它走实时事件通道，不经过 cron 队列，实测几秒内就开始跑。做法见下一节。
+- workflow 里加了一步 `Log trigger and start time`，会把本次是被哪条 cron 触发、
+  几点开始打印出来，方便以后核对晚了多久。
+
+---
+
+## 准点触发（可选）
+
+如果你确实需要每天准点跑（比如希望卡片一早就到），用一个外部定时器调
+`workflow_dispatch` 即可。需要一个**只对本仓库有 `Actions: write` 权限**的
+fine-grained PAT：
+
+```bash
+curl -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer <你的 PAT>" \
+  https://api.github.com/repos/<owner>/<repo>/actions/workflows/buddy-reward.yml/dispatches \
+  -d '{"ref":"main"}'
+```
+
+把这条请求挂到任意定时器上（cron-job.org、Cloudflare Workers cron、
+Google Cloud Scheduler，或本机的「任务计划程序」），时间设成每天 07:50，
+**注意定时器自己也有时区设置**，别设成 UTC。
+
+⚠️ 令牌是凭据。放在第三方定时器上，等于把「触发这个仓库工作流」的权限交给它：
+务必只授 `Actions: write`、只限这一个仓库，不要图省事用 classic PAT 的 `repo` 全权限。
+用本机任务计划程序则没有这个顾虑（令牌不出本机），代价是电脑得在那个点开着。
+
+两种触发方式**可以并存**，cron 留着当兜底：脚本幂等（重复签到返回「今天已签到」，
+旅行有每日上限），不会重复领取。定时器只负责「准点叫醒」，业务判断交给脚本。
 
 写 UTC 是更保守的写法（所有 GitHub 环境都认），所以默认用 UTC 版。
 

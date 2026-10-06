@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import hashlib
 import io
 import os
@@ -93,11 +94,17 @@ def blob_bytes(git: str, path: str) -> bytes:
 def build_bundle(git: str, files: list[str]) -> str:
     """打成 tar.gz 再 base64。
 
-    固定 mtime / uid / gid / uname，保证同样内容每次产出的字节一致，
-    这样「分享包指纹」才有意义。
+    固定 mtime / uid / gid / uname，并且**把 gzip 头的 mtime 也钉成 0**，
+    保证同样内容每次产出的字节一致，这样「分享包指纹」才有意义。
+
+    不要退回 tarfile 的 "w:gz"：gzip 头里会写当前时刻的 mtime，
+    于是同一份代码连跑三次会产出三个不同的哈希（长度还都一样，
+    不比对字节根本看不出来）。那样指纹就退化成一个一次性随机数，
+    拿它判断「发给朋友的那份是不是最新的」完全失效。
     """
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tf:
+    gz = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0)
+    with tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tf:
         for path in files:
             data = blob_bytes(git, path)
             info = tarfile.TarInfo(name=path)
@@ -107,6 +114,7 @@ def build_bundle(git: str, files: list[str]) -> str:
             info.uid = info.gid = 0
             info.uname = info.gname = ""
             tf.addfile(info, io.BytesIO(data))
+    gz.close()
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -214,7 +222,14 @@ def main(argv: list[str]) -> int:
         print("   -", f)
 
     bundle = build_bundle(git, files)
-    print("\nbundle base64 长度：{}".format(len(bundle)))
+
+    # 自检：同样的输入必须产出同样的字节。指纹是拿来跟朋友对账的唯一凭据，
+    # 一旦不可复现就毫无意义，所以这里当场验，不让它悄悄退化。
+    if build_bundle(git, files) != bundle:
+        raise SystemExit(
+            "构建不可复现：同样的仓库内容两次打包结果不同。\n"
+            "指纹对账会因此失效 —— 检查 tar/gzip 里是否又混进了时间戳。")
+    print("\nbundle base64 长度：{}（可复现自检通过）".format(len(bundle)))
 
     tmpl = open(TEMPLATE, encoding="utf-8").read()
     if "@@BUNDLE_B64@@" not in tmpl:
