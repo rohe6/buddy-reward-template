@@ -114,8 +114,16 @@ jobs:
           FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
         run: |
           set -euo pipefail
+          # cron 这一次只当兜底：如果外部定时器已经在准点跑过了，这里会是一次
+          # 「纯确认」（签到幂等跳过 + 旅行今日已派完），再发一张卡就是重复噪音。
+          # 所以只在 schedule 触发时加 --quiet-noop；workflow_dispatch（外部定时器、
+          # 手动补跑）照常推送。**失败永不静默**，判据见 feishu_notify.is_noop。
+          QUIET=""
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            QUIET="--quiet-noop"
+          fi
           if [ -f out/result.json ]; then
-            "$PYTHON_BIN" scripts/feishu_notify.py out/result.json || true
+            "$PYTHON_BIN" scripts/feishu_notify.py out/result.json $QUIET || true
           else
             echo "没有产出 result.json，跳过推送"
           fi

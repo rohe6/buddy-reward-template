@@ -324,39 +324,72 @@ high loads of GitHub Actions workflow runs … some queued jobs may be dropped`�
 
 ## 准点触发（可选）
 
-如果你确实需要每天准点跑（比如希望卡片一早就到），用一个外部定时器调
-`workflow_dispatch` 即可。需要一个**只对本仓库有 `Actions: write` 权限**的
-fine-grained PAT：
+如果确实需要每天准点跑（比如希望卡片一早就到），思路是：**别指望 cron，
+用另一个定时器去打 `workflow_dispatch` 接口**。它走实时事件通道，不经过 cron 队列，
+实测几秒内就开始跑。
+
+两种挂法，按「愿不愿意把令牌交给第三方」选：
+
+### 方案 A：本机任务计划程序（令牌不出本机，推荐）
+
+仓库里有现成的 `scripts/dispatch_once.py`，本机（或任何能跑 Python 的机器）这样调用：
 
 ```bash
-curl -X POST \
-  -H "Accept: application/vnd.github+json" \
-  -H "Authorization: Bearer <你的 PAT>" \
-  https://api.github.com/repos/<owner>/<repo>/actions/workflows/buddy-reward.yml/dispatches \
-  -d '{"ref":"main"}'
+export GH_DISPATCH_TOKEN=<你的令牌>
+python3 scripts/dispatch_once.py --repo <owner>/<repo>
 ```
 
-把这条请求挂到任意定时器上（cron-job.org、Cloudflare Workers cron、
-Google Cloud Scheduler，或本机的「任务计划程序」），时间设成每天 07:50，
-**注意定时器自己也有时区设置**，别设成 UTC。
+先手动跑一次看有没有 `已触发`，然后交给系统定时器：
 
-⚠️ 令牌是凭据。放在第三方定时器上，等于把「触发这个仓库工作流」的权限交给它：
-务必只授 `Actions: write`、只限这一个仓库，不要图省事用 classic PAT 的 `repo` 全权限。
-用本机任务计划程序则没有这个顾虑（令牌不出本机），代价是电脑得在那个点开着。
+- **Windows**：任务计划程序 → 新建任务 → 触发器「每天 07:50」→ 操作「启动程序」，
+  程序填 `pythonw.exe` 的完整路径，参数填 `scripts\dispatch_once.py --repo <owner>/<repo>`，
+  并在「设置」里勾上**「如果错过了计划开始时间，请尽快启动任务」**（电脑那时没开机会补跑）。
+- **Linux/macOS**：`systemd timer` 或 `cron`，每天 07:50 跑同一行命令。
 
-两种触发方式**可以并存**，cron 留着当兜底：脚本幂等（重复签到返回「今天已签到」，
-旅行有每日上限），不会重复领取。定时器只负责「准点叫醒」，业务判断交给脚本。
+令牌放在本机（环境变量或凭据文件），不会离开这台机器。代价是电脑得在那个点开着。
 
-写 UTC 是更保守的写法（所有 GitHub 环境都认），所以默认用 UTC 版。
+### 方案 B：第三方定时服务（不需要本机开机）
+
+在 cron-job.org / Cloudflare Workers cron / Google Cloud Scheduler 里建一个
+每天 07:50（时区选 **Asia/Shanghai**，很多服务默认 UTC，那就是 15:50）的 HTTP 请求。
+`--show-config` 会把该填的东西打印出来，不用自己拼：
+
+```bash
+python3 scripts/dispatch_once.py --repo <owner>/<repo> --show-config
+```
+
+成功标志是 **HTTP 204**。接口只负责「叫醒」，执行结果去 Actions 页面看。
+
+⚠️ **令牌是凭据。** 放在第三方服务上，等于把「触发这个仓库工作流」的权限交给它：
+请单独建一个 **fine-grained PAT**，只授权这一个仓库、只勾 `Actions: write`，
+不要图省事用 classic PAT 的 `repo` 全权限。fine-grained PAT 有有效期上限，
+到期后定时器会开始返回 401 —— 记得续。
+
+### 和 cron 并存时不会收到两张卡
+
+cron 留着当兜底（第三方定时器挂了、或本机没开机时它还能救一次）。两者并存时，
+cron 那次通常已经无事可做，所以 workflow 在 **`schedule` 触发时给通知脚本加了
+`--quiet-noop`**：只有「签到幂等跳过 **且** 旅行今日已派完」这种纯确认才不推送。
+
+**失败永远不会被静默** —— 任何 401、签到失败、旅行异常照常发卡片。
+判据见 `scripts/feishu_notify.py` 的 `is_noop()`，写得很窄，宁可多发也不漏报。
+
+---
+
+## 常见问题（续）
 
 **Q：定时任务会不会自己停掉？**
 会，两种情况：**公开仓库**里 60 天没有任何仓库活动，schedule 会被自动禁用（会先发邮件提醒，
 去 Actions 页点 Enable workflow 就能恢复）；fork 来的仓库默认不跑 schedule。
 私有仓库不受 60 天规则影响，但每天一次约 30 秒的运行会消耗免费额度（每月 2000 分钟，够用）。
 
-**Q：cron 时间到点了为什么没跑？**
-先看三处：① workflow 是否在**默认分支**上；② Actions 是否被禁用；
-③ 是否刚好卡在整点高峰（已通过 :07 规避）。排完这三点就用 `workflow_dispatch` 手动跑一次确认逻辑没问题。
+**Q：cron 时间到点了为什么没跑，或者晚了好几个小时？**
+按顺序排三处：① workflow 是否在**默认分支**上；② Actions 是否被禁用；
+③ **是不是又撞上 GitHub 的调度积压**（自 2026-08 起这是常态，晚 3~10 小时都算「正常」，
+详见上面那条 FAQ，不是配置问题）。
+前两点排除后，用 `workflow_dispatch` 手动跑一次即可确认脚本本身没问题；
+workflow 第一步 `Log trigger and start time` 会打印它实际是几点开始的，
+把那个时间和 cron 一对，就知道晚了多久。
 
 **Q：可以在 GitHub 上直接看到凭证吗？**
 不能。Secret 写入后只能覆盖、不能读回。万一怀疑泄漏，去飞书 / WorkBuddy 网页版

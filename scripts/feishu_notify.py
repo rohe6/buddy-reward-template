@@ -110,6 +110,31 @@ def travel_lines(t: dict) -> tuple[str, str]:
         t.get("reason") or "未知原因")
 
 
+# 「猫猫这边没什么新动作」的状态：今天已经派过一趟，或者猫猫还在路上。
+# 都没到能领奖励的时候，所以这次运行在旅行侧没有新信息。
+NOOP_TRAVEL_STATUSES = frozenset({"daily_limit_reached", "traveling"})
+
+
+def is_noop(result: dict) -> bool:
+    """这次运行是不是「纯确认」——没新做任何事，也没出错。
+
+    用途：外部定时器准点触发 + cron 兜底并存时，兜底那次通常是纯确认
+    （签到幂等跳过、旅行今日已派完），没必要把同一件事再发一张卡片。
+
+    **判据刻意收得很窄**：只认 already_checked + {daily_limit_reached, traveling}。
+    任何失败、任何凭证问题、以及形状不认识的 status_only 都不算 noop ——
+    宁可多发一张卡，也不能把该报的静默掉。
+    """
+    c = result.get("checkin") or {}
+    t = result.get("travel") or {}
+    if result.get("credential_expired"):
+        return False
+    if not (c.get("ok") and t.get("ok")):
+        return False
+    return (c.get("status") == "already_checked"
+            and t.get("status") in NOOP_TRAVEL_STATUSES)
+
+
 def build_card(result: dict) -> dict:
     c = result.get("checkin") or {}
     t = result.get("travel") or {}
@@ -196,6 +221,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("result", help="cloud_runner.py 产出的 result.json")
     ap.add_argument("--text", action="store_true", help="发纯文本而不是卡片")
     ap.add_argument("--dry-run", action="store_true", help="只打印将要发送的 JSON，不真的发")
+    ap.add_argument("--quiet-noop", action="store_true",
+                    help="这次是「纯确认」（签到幂等跳过 + 旅行今日已派完）就不推送。"
+                         "给 cron 兜底用，避免和准点触发那次重复发卡。失败永不静默。")
     args = ap.parse_args(argv[1:])
 
     with open(args.result, encoding="utf-8") as f:
@@ -205,6 +233,10 @@ def main(argv: list[str]) -> int:
 
     if args.dry_run:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.quiet_noop and is_noop(result):
+        print("本次没有新动作（签到幂等跳过、旅行今日已派完），按 --quiet-noop 跳过推送")
         return 0
 
     webhook = (os.environ.get(ENV_WEBHOOK) or "").strip()
