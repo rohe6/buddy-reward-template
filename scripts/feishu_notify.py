@@ -163,8 +163,14 @@ def build_card(result: dict) -> dict:
     if expired:
         elements.append({"tag": "hr"})
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content":
-            "**🔑 需要刷新凭证**\n本机网页会话已过期。请在常开电脑上重新运行 "
-            "`refresh_credentials.py` 注入新凭证。"}})
+            "**🔑 要做的只有一件事：重新登录一次**\n"
+            "过网关的 `session` / `session_2` 只有**页面响应**才会下发，"
+            "而且从登录那一刻起 **7 天绝对到期**；调接口不会把它续上。\n"
+            "所以服务端注销之后，把旧 Cookie 再推一遍 Secret 是**没用**的。\n\n"
+            "**做法**：在这台常开的电脑上双击 `renew-credentials.cmd`，"
+            "在弹出的浏览器窗口里真正登录一次 —— 它会自动校验并注入新凭证。\n"
+            "之后靠本机的每日续期任务自动滚动"
+            "（若还没注册过，双击 `install-keepalive.cmd` 注册一次）。"}})
 
     elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content":
         "运行时间 {}（UTC+8） · 签到{} · 猫猫{}".format(
